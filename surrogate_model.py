@@ -255,21 +255,29 @@ def compute_and_save_covariance_samples(n_samples, output_file):
     
     records = []
     for i, lambdas in enumerate(lambda_samples):
-        # Calcola la matrice di covarianza e la norma
-        cov_matrix, x_opt = compute_covariance_for_lambda(
-            lambdas,  # Passa il vettore di lambda
-            delta=0.01,  # Specifica il passo di perturbazione
-            base_seed=GLOBAL_SEED + i  # Usa il seme per la riproducibilità
-        )
         
-        # Salva i risultati in un dizionario
+        cov_matrix, x_opt = compute_covariance_for_lambda(
+            lambdas,  
+            delta=0.01,  
+            base_seed=GLOBAL_SEED + i  
+        )
+        # Calculate triangular matrix P from covariance matrix
+        try:
+            P = np.linalg.cholesky(cov_matrix).T  
+            P_flattened = P[np.triu_indices_from(P)]  
+        except np.linalg.LinAlgError:
+            P = np.full_like(cov_matrix, np.nan)
+            P_flattened = np.full((cov_matrix.shape[0] * (cov_matrix.shape[0] + 1)) // 2, np.nan)
+
         records.append({
             'lambda1': lambdas[0],
             'lambda2': lambdas[1],
             'lambda3': lambdas[2],
-            'x_opt': x_opt.tolist(),  # Salva x_opt come lista
-            'cov_matrix': cov_matrix.tolist(),  # Salva la matrice come lista
-            'sensitivity_norm': np.linalg.norm(cov_matrix, ord='fro')  # Norma di Frobenius
+            'x_opt': x_opt.tolist(),  
+            'cov_matrix': cov_matrix.tolist(),  
+            'sensitivity_norm': np.linalg.norm(cov_matrix, ord='fro'), 
+            'P_matrix': P.tolist(), 
+            'P_flattened': P_flattened.tolist() 
         })
 
     df = pd.DataFrame(records)
@@ -659,7 +667,7 @@ def plot_gp_surface_with_test_points_enhanced(model, X_train_orig, y_train_orig,
     fig = plt.figure(figsize=(15, 12))
     ax = fig.add_subplot(111, projection='3d')
     
-    # 1. Create a grid for the lambda simplex surface
+    # Create a grid for the lambda simplex surface
     resolution = 40
     l1_lin = np.linspace(0, 1, resolution)
     l2_lin = np.linspace(0, 1, resolution)
@@ -678,17 +686,17 @@ def plot_gp_surface_with_test_points_enhanced(model, X_train_orig, y_train_orig,
     y_grid_scaled, _ = model.predict(X_grid_scaled, return_std=True) # std not used for surface here
     y_grid_pred = scaler_y_fitted.inverse_transform(y_grid_scaled.reshape(-1,1)).ravel()
 
-    # 2. Plot the GP surface using triangulation
+    # Plot the GP surface using triangulation
     # The surface is for the mean prediction
     surf = ax.plot_trisurf(grid_l1, grid_l2, y_grid_pred, cmap=cm.viridis, alpha=0.7, 
                            linewidth=0.1, antialiased=True, edgecolor='none', shade=True)
     fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10, pad=0.1, label=f'Predicted {title_suffix}')
 
-    # 3. Plot training points (unscaled)
+    # Plot training points (unscaled)
     ax.scatter(X_train_orig[:, 0], X_train_orig[:, 1], y_train_orig.ravel(), 
                c='blue', marker='o', s=30, label='Training Points', alpha=0.7, depthshade=False, edgecolors='w', linewidth=0.5)
 
-    # 4. Plot test points (unscaled), colored by their absolute error
+    # Plot test points (unscaled), colored by their absolute error
     # Ensure test_point_errors has a suitable range for colormap
     min_err, max_err = np.min(test_point_errors), np.max(test_point_errors)
     if min_err == max_err: # Handle case with uniform error (e.g., single test point)
@@ -711,7 +719,7 @@ def plot_gp_surface_with_test_points_enhanced(model, X_train_orig, y_train_orig,
     cbar_errors = fig.colorbar(sm, ax=ax, shrink=0.5, aspect=10, pad=0.02, label='Absolute Prediction Error on Test Points')
 
 
-    # 5. Aesthetics and Labels
+    # Aesthetics and Labels
     ax.set_xlabel('$\lambda_1$', fontsize=14)
     ax.set_ylabel('$\lambda_2$', fontsize=14)
     ax.set_zlabel(f'True/Predicted {title_suffix}', fontsize=14)
