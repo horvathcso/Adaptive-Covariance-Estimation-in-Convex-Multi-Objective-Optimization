@@ -128,59 +128,99 @@ def find_optimal_x_for_cov_wrapper(lambda_coeffs_tuple, workers_for_de, seed_for
     )
     
     return result.x[0], result.fun
-def compute_covariance_for_lambda(lambda_vec_tuple, n_jobs=-1, base_seed=None):
+
+def compute_covariance_for_lambda(lambdas, delta=0.01, base_seed=None):
     """
-    Computes the covariance matrix of optimal x values for perturbed lambdas, deterministically.
-    lambda_vec_tuple: The central lambda vector (tuple).
-    n_jobs: Number of parallel jobs for optimization runs.
-    base_seed: Seed to initialize the random number generator for perturbations
-               and to derive seeds for the optimizer. If None, behavior might be stochastic.
-    Returns: (covariance_matrix, norm_of_covariance_matrix)
+    Compute the covariance matrix for a given lambda vector by perturbing its components.
+    
+    Args:
+        lambdas: Array-like, the lambda vector (must sum to 1).
+        delta: Float, the perturbation step size.
+        base_seed: Optional, seed for reproducibility.
+    
+    Returns:
+        perturbed_losses: 3x3 covariance matrix.
+        x_opt: Optimal x for the base lambda vector.
     """
-    lambda_vec = np.array(lambda_vec_tuple)
+    # Converti lambdas in un array NumPy per supportare operazioni come .copy()
+    lambdas = np.array(lambdas)
     
-    # Initialize RNG for generating perturbations
-    # If base_seed is None, np.random.default_rng() uses system entropy, making it non-deterministic.
-    # For full determinism, a base_seed should always be provided.
-    rng = np.random.default_rng(base_seed)
+    # Calculate the optimal loss at the base lambda point
+    x_opt, base_loss = optimize_for_lambda(lambdas)
     
-    perturbed_lambdas_list = generate_perturbed_lambdas(lambda_vec, NUM_PERTURBATIONS, PERTURBATION_STRENGTH, rng)
+    # Store perturbed losses
+    perturbed_losses = np.zeros((3, 3))
     
-    if not perturbed_lambdas_list:
-        # print(f"Warning: No valid perturbations for lambda {lambda_vec_tuple} with seed {base_seed}")
-        return np.zeros((2,2)), 0.0
-
-    # Prepare arguments for parallel execution, ensuring each job gets a deterministic seed
-    # The seed for each optimizer call is derived from base_seed.
-    # Using enumerate to get an index for deriving unique seeds for each parallel job.
-    # Note: joblib's delayed function captures arguments at definition time.
+    # For each pair of lambdas, calculate the perturbation effect
+    for i in range(3):
+        for j in range(3):
+            if i == j:
+                # Diagonal elements - single parameter perturbation
+                if i < 2:  # Only perturb λ1 and λ2 directly
+                    lambda_perturbed = lambdas.copy()
+                    lambda_perturbed[i] += delta
+                    lambda_perturbed[2] -= delta
+                    
+                    if np.all(lambda_perturbed >= 0):
+                        x_pert, pert_loss = optimize_for_lambda(lambda_perturbed)
+                        perturbed_losses[i, i] = (pert_loss - base_loss) / delta
+                    else:
+                        lambda_perturbed = lambdas.copy()
+                        lambda_perturbed[i] -= delta
+                        lambda_perturbed[2] += delta
+                        
+                        if np.all(lambda_perturbed >= 0):
+                            x_pert, pert_loss = optimize_for_lambda(lambda_perturbed)
+                            perturbed_losses[i, i] = (base_loss - pert_loss) / delta
+                        else:
+                            perturbed_losses[i, i] = 0
+                else:
+                    lambda_perturbed = lambdas.copy()
+                    lambda_perturbed[0] -= delta / 2
+                    lambda_perturbed[1] -= delta / 2
+                    lambda_perturbed[2] += delta
+                    
+                    if np.all(lambda_perturbed >= 0):
+                        x_pert, pert_loss = optimize_for_lambda(lambda_perturbed)
+                        perturbed_losses[2, 2] = (pert_loss - base_loss) / delta
+                    else:
+                        perturbed_losses[2, 2] = 0
+            elif i < 2 and j < 2:
+                lambda_perturbed = lambdas.copy()
+                lambda_perturbed[i] += delta / 2
+                lambda_perturbed[j] += delta / 2
+                lambda_perturbed[2] -= delta
+                
+                if np.all(lambda_perturbed >= 0):
+                    x_pert, pert_loss = optimize_for_lambda(lambda_perturbed)
+                    single_i_change = perturbed_losses[i, i] * delta / 2
+                    single_j_change = perturbed_losses[j, j] * delta / 2
+                    total_change = pert_loss - base_loss
+                    interaction = total_change - single_i_change - single_j_change
+                    perturbed_losses[i, j] = interaction / ((delta / 2) * (delta / 2))
+                    perturbed_losses[j, i] = perturbed_losses[i, j]
+                else:
+                    perturbed_losses[i, j] = 0
+                    perturbed_losses[j, i] = 0
+            elif i < 2 and j == 2:
+                lambda_perturbed = lambdas.copy()
+                lambda_perturbed[i] += delta / 2
+                lambda_perturbed[j] += delta / 2
+                lambda_perturbed[1 - i] -= delta
+                
+                if np.all(lambda_perturbed >= 0):
+                    x_pert, pert_loss = optimize_for_lambda(lambda_perturbed)
+                    single_i_change = perturbed_losses[i, i] * delta / 2
+                    single_j_change = perturbed_losses[j, j] * delta / 2
+                    total_change = pert_loss - base_loss
+                    interaction = total_change - single_i_change - single_j_change
+                    perturbed_losses[i, j] = interaction / ((delta / 2) * (delta / 2))
+                    perturbed_losses[j, i] = perturbed_losses[i, j]
+                else:
+                    perturbed_losses[i, j] = 0
+                    perturbed_losses[j, i] = 0
     
-    tasks = []
-    for i, pl_coeffs in enumerate(perturbed_lambdas_list):
-        # Derive a unique, deterministic seed for each optimization run
-        optimizer_seed_for_this_task = base_seed + i + 1 if base_seed is not None else None
-        tasks.append(delayed(find_optimal_x_for_cov_wrapper)(pl_coeffs, workers_for_de=1, seed_for_optimizer=optimizer_seed_for_this_task))
-
-    optimal_xs_for_perturbations = Parallel(n_jobs=n_jobs)(tasks)
-    
-    optimal_xs_array = np.array(optimal_xs_for_perturbations)
-    
-    if optimal_xs_array.shape[0] < 2:
-        # print(f"Warning: Less than 2 optimal_xs samples for lambda {lambda_vec_tuple}, shape {optimal_xs_array.shape}")
-        return np.full((2,2), np.nan), np.nan
-
-    try:
-        # rowvar=False because each row of optimal_xs_array is an observation (an x-vector),
-        # and columns are the variables (x[0], x[1]).
-        cov_matrix = np.cov(optimal_xs_array, rowvar=False) 
-    except Exception as e:
-        print(f"Error computing covariance for {lambda_vec_tuple} with base_seed {base_seed}: {e}")
-        return np.full((2,2), np.nan), np.nan
-
-    norm_cov = np.linalg.norm(cov_matrix)
-    return cov_matrix, norm_cov
-
-
+    return perturbed_losses, x_opt
 
 
 def generate_lambda_samples(num_samples):
@@ -207,28 +247,36 @@ def generate_lambda_samples(num_samples):
     
     return list(set(samples)) # Remove duplicates
 
-def compute_and_save_covariance_samples(n_samples=NUM_LAMBDA_SAMPLES, output_file='losses.csv'):
+def compute_and_save_covariance_samples(n_samples, output_file):
+    """
+    Generates lambda samples, computes covariance matrices, and saves the results to a CSV file.
+    """
     lambda_samples = generate_lambda_samples(n_samples)
     
     records = []
     for i, lambdas in enumerate(lambda_samples):
-        cov_matrix, norm_val = compute_covariance_for_lambda(
-            lambda_vec_tuple=lambdas,
-            n_jobs=4,
-            base_seed=GLOBAL_SEED + i
+        # Calcola la matrice di covarianza e la norma
+        cov_matrix, x_opt = compute_covariance_for_lambda(
+            lambdas,  # Passa il vettore di lambda
+            delta=0.01,  # Specifica il passo di perturbazione
+            base_seed=GLOBAL_SEED + i  # Usa il seme per la riproducibilità
         )
+        
+        # Salva i risultati in un dizionario
         records.append({
             'lambda1': lambdas[0],
             'lambda2': lambdas[1],
             'lambda3': lambdas[2],
-            'sensitivity_norm': norm_val
+            'x_opt': x_opt.tolist(),  # Salva x_opt come lista
+            'cov_matrix': cov_matrix.tolist(),  # Salva la matrice come lista
+            'sensitivity_norm': np.linalg.norm(cov_matrix, ord='fro')  # Norma di Frobenius
         })
 
     df = pd.DataFrame(records)
     df.to_csv(output_file, index=False)
     return df
 
-def load_lambda_covariance_data(file_path='losses.csv'):
+def load_lambda_covariance_data(file_path='lambda_covariance_samples.csv'):
     """Load the lambda-covariance data from CSV file"""
     return pd.read_csv(file_path)
 

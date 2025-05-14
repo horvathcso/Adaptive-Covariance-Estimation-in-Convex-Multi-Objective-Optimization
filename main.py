@@ -1,4 +1,4 @@
-from Articolo.surrogate_model import fit_gp_model, evaluate_model, plot_gp_surface_with_test_points, plot_predicted_vs_true, plot_gp_surface_with_test_points_enhanced, load_lambda_covariance_data, compute_and_save_covariance_samples, visualize_covariance_results, plot_optimal_values_surface, optimize_for_lambda
+from surrogate_model import fit_gp_model, evaluate_model, plot_gp_surface_with_test_points, plot_predicted_vs_true, plot_gp_surface_with_test_points_enhanced, load_lambda_covariance_data, compute_and_save_covariance_samples, visualize_covariance_results, plot_optimal_values_surface, optimize_for_lambda
 import numpy as np
 import matplotlib.pyplot as plt
 import os
@@ -20,7 +20,7 @@ NUM_LAMBDA_SAMPLES = 1000 # Number of base lambda vectors for dataset
 
 # Execute the code
 def main():
-    dataset_file = 'losses.csv'
+    dataset_file = 'lambda_covariance_samples.csv'
     
     # Plot the optimal loss 3D surface
     plot_optimal_values_surface()
