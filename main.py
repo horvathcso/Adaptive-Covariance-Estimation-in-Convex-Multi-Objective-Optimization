@@ -13,14 +13,14 @@ DE_TOL = 1e-3 # Tolerance for differential_evolution
 NUM_PERTURBATIONS = 20 # Number of perturbations for covariance estimation
 PERTURBATION_STRENGTH = 0.025 # Strength of lambda perturbations
 GLOBAL_SEED = 42 # Define a global seed for reproducibility
-
+np.random.seed(GLOBAL_SEED)
 # --- Data generation parameters ---
 NUM_LAMBDA_SAMPLES = 1000 # Number of base lambda vectors for dataset
 
 
 # Execute the code
 def main():
-    dataset_file = 'lambda_covariance_samples.csv'
+    dataset_file = 'dtlz2_cov.csv'
     
     # Plot the optimal loss 3D surface
     plot_optimal_values_surface()
@@ -82,7 +82,7 @@ def main():
     y_pred, y_std, metrics = evaluate_model(model, X_test, y_test, scaler_X, scaler_y)
     
     # Print metrics
-    print("\nModel performance on test data:")
+    print("\nModel performance on test data (before Active Learning):")
     for metric, value in metrics.items():
         print(f"{metric}: {value:.4f}")
     

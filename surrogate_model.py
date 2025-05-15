@@ -10,19 +10,18 @@ from sklearn.gaussian_process.kernels import Matern, ConstantKernel, WhiteKernel
 from sklearn.metrics import mean_squared_error, r2_score
 from scipy.optimize import minimize
 from scipy.optimize import differential_evolution
-from joblib import delayed, Parallel
-import os
-
+from pymoo.problems.many import DTLZ2
+from scipy.stats import norm
 # --- Covariance computation parameters ---
 NUM_PERTURBATIONS = 20 # Number of perturbations for covariance estimation
 PERTURBATION_STRENGTH = 0.025 # Strength of lambda perturbations
 GLOBAL_SEED = 42 # Define a global seed for reproducibility
-
+np.random.seed(GLOBAL_SEED)
 # --- Data generation parameters ---
 NUM_LAMBDA_SAMPLES = 1000 # Number of base lambda vectors for dataset
 # Problem Definition
 
-def problem(x, lambdas):
+'''def problem(x, lambdas):
     f1 = x * np.cos(x) - x**3 + np.sin(x)
     f2 = 5 * np.sin(x) + 5 * x**3 - np.cos(x) * np.exp(x)
     f3 = -4 * x**4 * np.cos(x) + np.sin(x) * np.exp(-x)
@@ -47,7 +46,46 @@ def optimize_for_lambda(lambdas, x_range=(-2, 2)):
             lowest_loss = result.fun
             best_result = result
     
-    return best_result.x[0], best_result.fun
+    return best_result.x[0], best_result.fun'''
+    
+# Problem Definition
+n_obj = 3
+k = 20
+n_vars = n_obj + k - 1 
+problem = DTLZ2(n_var=n_vars, n_obj=n_obj)
+
+def scalarized_objective(x, lambdas):
+    
+    f = problem.evaluate(np.array([x]))[0]  
+    
+    return np.dot(lambdas, f)  
+
+
+def optimize_for_lambda(lambdas, x_range=(0.0, 1.0)):
+    
+    lambdas = np.array(lambdas)
+    
+    if not np.isclose(np.sum(lambdas), 1.0) or np.any(lambdas < 0):
+        raise ValueError("lambdas must be non-negative and sum to 1")
+    
+    objective = lambda x: scalarized_objective(x, lambdas)
+    
+    # Use multiple starting points to avoid local minima
+    starting_points = np.linspace(x_range[0], x_range[1], 10)
+    best_result = None
+    lowest_loss = float('inf')
+    
+    for start in starting_points:
+        result = minimize(objective, 
+                          x0=np.full(n_vars, start), 
+                          bounds=[(x_range[0], x_range[1])] * n_vars, 
+                          method='L-BFGS-B')
+        if result.fun < lowest_loss:
+            lowest_loss = result.fun
+            best_result = result
+    
+    return best_result.x, best_result.fun
+
 
 
 def generate_perturbed_lambdas(lambda_vec, num_perturbations, strength, rng):
@@ -129,7 +167,7 @@ def find_optimal_x_for_cov_wrapper(lambda_coeffs_tuple, workers_for_de, seed_for
     
     return result.x[0], result.fun
 
-def compute_covariance_for_lambda(lambdas, delta=0.01, base_seed=None):
+def hessian_estimation_for_lambda(lambdas, delta=0.01, base_seed=None):
     """
     Compute the covariance matrix for a given lambda vector by perturbing its components.
     
@@ -141,6 +179,8 @@ def compute_covariance_for_lambda(lambdas, delta=0.01, base_seed=None):
     Returns:
         perturbed_losses: 3x3 covariance matrix.
         x_opt: Optimal x for the base lambda vector.
+        
+    #descrive quanto cambia il valore ottimale del loss scalarizzato rispetto ai pesi
     """
     # Converti lambdas in un array NumPy per supportare operazioni come .copy()
     lambdas = np.array(lambdas)
@@ -219,8 +259,36 @@ def compute_covariance_for_lambda(lambdas, delta=0.01, base_seed=None):
                 else:
                     perturbed_losses[i, j] = 0
                     perturbed_losses[j, i] = 0
-    
+    # perturbed_losses : how changes the optimal loss (F) with respect to the perturbations of the lambdas
     return perturbed_losses, x_opt
+
+def estimate_local_covariances_from_lambdas(lambda_vec, num_perturbations=10, delta=0.01):
+    """
+    Estimate the covariance of the optimal solution and objective function
+    for a given lambda vector by perturbing it.
+    """
+    # Create a random number generator
+    rng = np.random.default_rng(GLOBAL_SEED)
+    
+    # Generate perturbed lambda vectors
+    lambda_perturbed_set = generate_perturbed_lambdas(lambda_vec, num_perturbations, delta, rng)
+
+    x_list = []
+    f_list = []
+
+    for lam in lambda_perturbed_set:
+        x_opt, _ = optimize_for_lambda(lam)
+        f_val = problem.evaluate(np.array([x_opt]))[0]
+        x_list.append(x_opt)
+        f_list.append(f_val)
+
+    X = np.array(x_list)
+    F = np.array(f_list)
+
+    Sigma_x = np.cov(X.T)  # How the optimal x changes through perturbations of lambda
+    Sigma_f = np.cov(F.T)  # How the optimal f changes through perturbations of lambda
+
+    return Sigma_x, Sigma_f  
 
 
 def generate_lambda_samples(num_samples):
@@ -232,7 +300,8 @@ def generate_lambda_samples(num_samples):
     # Generate samples using random numbers and normalization
     # y_i = -log(u_i), where u_i ~ U(0,1)
     # lambda_i = y_i / sum(y_j)
-    raw_samples = -np.log(np.random.rand(num_samples, 3))
+    rng = np.random.default_rng(GLOBAL_SEED)
+    raw_samples = -np.log(rng.random((num_samples, 3)))
     for sample in raw_samples:
         samples.append(tuple(sample / np.sum(sample)))
     
@@ -249,17 +318,24 @@ def generate_lambda_samples(num_samples):
 
 def compute_and_save_covariance_samples(n_samples, output_file):
     """
-    Generates lambda samples, computes covariance matrices, and saves the results to a CSV file.
+    Generates lambda samples, computes covariance matrices, solution covariance, 
+    objective covariance, and saves the results to a CSV file.
     """
     lambda_samples = generate_lambda_samples(n_samples)
     
     records = []
     for i, lambdas in enumerate(lambda_samples):
-        
-        cov_matrix, x_opt = compute_covariance_for_lambda(
+        # Compute the covariance matrix and optimal solution for the given lambda
+        cov_matrix, x_opt = hessian_estimation_for_lambda(
             lambdas,  
             delta=0.01,  
             base_seed=GLOBAL_SEED + i  
+        )
+        # Compute the solution covariance and objective covariance
+        Sigma_x, Sigma_f = estimate_local_covariances_from_lambdas(
+            lambda_vec=lambdas, 
+            num_perturbations=NUM_PERTURBATIONS, 
+            delta=PERTURBATION_STRENGTH
         )
         # Calculate triangular matrix P from covariance matrix
         try:
@@ -269,22 +345,26 @@ def compute_and_save_covariance_samples(n_samples, output_file):
             P = np.full_like(cov_matrix, np.nan)
             P_flattened = np.full((cov_matrix.shape[0] * (cov_matrix.shape[0] + 1)) // 2, np.nan)
 
+        # Append the results to the records
         records.append({
             'lambda1': lambdas[0],
             'lambda2': lambdas[1],
             'lambda3': lambdas[2],
             'x_opt': x_opt.tolist(),  
-            'cov_matrix': cov_matrix.tolist(),  
+            'cov_matrix': cov_matrix.tolist(), 
+            'solution_covariance': Sigma_x.tolist(),  # Add Sigma_x from estimate_local_covariances_from_lambdas
+            'objective_covariance': Sigma_f.tolist(),  # Add Sigma_f from estimate_local_covariances_from_lambdas
             'sensitivity_norm': np.linalg.norm(cov_matrix, ord='fro'), 
             'P_matrix': P.tolist(), 
             'P_flattened': P_flattened.tolist() 
         })
 
+    # Save the records to a CSV file
     df = pd.DataFrame(records)
     df.to_csv(output_file, index=False)
     return df
 
-def load_lambda_covariance_data(file_path='lambda_covariance_samples.csv'):
+def load_lambda_covariance_data(file_path='dtlz2_cov.csv'):
     """Load the lambda-covariance data from CSV file"""
     return pd.read_csv(file_path)
 
@@ -496,19 +576,19 @@ def visualize_covariance_results(df):
     
     ax1.set_xlabel('Lambda 1', fontsize=12)
     ax1.set_ylabel('Lambda 2', fontsize=12)
-    ax1.set_title('Sensitivity of Optimal Loss to Lambda Perturbations (losses)', fontsize=14)
+    ax1.set_title('Sensitivity of Optimal Loss to Lambda Perturbations (dtlz2)', fontsize=14)
     ax1.set_aspect('equal')
     
-    plt.savefig('sensitivity_norm_simplex_losses.png', dpi=300)
+    plt.savefig('sensitivity_norm_simplex_dtlz2.png', dpi=300)
     
     # 2. Histogram of sensitivity norms
     fig2, ax2 = plt.subplots(figsize=(10, 6))
     ax2.hist(df['sensitivity_norm'], bins=30, alpha=0.7, color='skyblue', edgecolor='black')
     ax2.set_xlabel('Sensitivity Norm', fontsize=12)
     ax2.set_ylabel('Frequency', fontsize=12)
-    ax2.set_title('Distribution of Sensitivity Norms (losses)', fontsize=14)
+    ax2.set_title('Distribution of Sensitivity Norms (dtlz2)', fontsize=14)
     
-    plt.savefig('sensitivity_norm_histogram_losses.png', dpi=300)
+    plt.savefig('sensitivity_norm_histogram_dtlz2.png', dpi=300)
     
     # 3. 3D scatter plot of lambdas and sensitivity
     fig3 = plt.figure(figsize=(12, 10))
@@ -520,18 +600,18 @@ def visualize_covariance_results(df):
     ax3.set_xlabel('Lambda 1', fontsize=12)
     ax3.set_ylabel('Lambda 2', fontsize=12)
     ax3.set_zlabel('Lambda 3', fontsize=12)
-    ax3.set_title('Lambda Values, Sensitivity, and Optimal Loss (losses)', fontsize=14)
+    ax3.set_title('Lambda Values, Sensitivity, and Optimal Loss (dtlz2)', fontsize=14)
     
     fig3.colorbar(scatter3, ax=ax3, label='Sensitivity Norm')
     
-    plt.savefig('lambda_sensitivity_3d_losses.png', dpi=300)
+    plt.savefig('lambda_sensitivity_3d_dtlz2.png', dpi=300)
     
     return fig1, fig2, fig3
 
 def plot_gp_surface_with_test_points(model, X_train, X_test, y_train, y_test, y_pred, 
                                     y_std, scaler_X, scaler_y):
     """
-    Plot the GP model surface and the test points for the losses problem
+    Plot the GP model surface and the test points 
     """
     # Create a grid for the lambda simplex
     resolution = 50
@@ -580,10 +660,10 @@ def plot_gp_surface_with_test_points(model, X_train, X_test, y_train, y_test, y_
     ax.set_xlabel('Lambda 1')
     ax.set_ylabel('Lambda 2')
     ax.set_zlabel('Sensitivity Norm')
-    ax.set_title('GP Model of Sensitivity for losses')
+    ax.set_title('GP Model of Sensitivity for dtlz2')
     ax.legend()
     
-    plt.savefig('gp_sensitivity_surface_losses.png', dpi=300, bbox_inches='tight')
+    plt.savefig('gp_sensitivity_surface_dtlz2.png', dpi=300, bbox_inches='tight')
     
     # Create a 2D plot of the model prediction on the simplex with uncertainty
     fig2, ax2 = plt.subplots(figsize=(10, 8))
@@ -609,17 +689,17 @@ def plot_gp_surface_with_test_points(model, X_train, X_test, y_train, y_test, y_
     
     ax2.set_xlabel('Lambda 1')
     ax2.set_ylabel('Lambda 2')
-    ax2.set_title('GP Model Prediction on Lambda Simplex (losses)')
+    ax2.set_title('GP Model Prediction on Lambda Simplex (dtlz2)')
     ax2.set_aspect('equal')
     ax2.legend()
     
-    plt.savefig('gp_sensitivity_2d_losses.png', dpi=300, bbox_inches='tight')
+    plt.savefig('gp_sensitivity_2d_dtlz2.png', dpi=300, bbox_inches='tight')
     
     return fig, fig2
 
 def plot_predicted_vs_true(y_test, y_pred, y_std):
     """
-    Create a scatter plot of predicted vs true sensitivity norms for losses
+    Create a scatter plot of predicted vs true sensitivity norms 
     """
     fig, ax = plt.subplots(figsize=(10, 8))
     
@@ -641,7 +721,7 @@ def plot_predicted_vs_true(y_test, y_pred, y_std):
     # Set labels and title
     ax.set_xlabel('True Sensitivity Norm')
     ax.set_ylabel('Predicted Sensitivity Norm')
-    ax.set_title('Predicted vs. True Sensitivity Norm (losses)')
+    ax.set_title('Predicted vs. True Sensitivity Norm (dtlz2)')
     
     # Add a grid for better readability
     ax.grid(True, alpha=0.3)
@@ -650,7 +730,7 @@ def plot_predicted_vs_true(y_test, y_pred, y_std):
     ax.set_aspect('equal')
     
     plt.tight_layout()
-    plt.savefig('predicted_vs_true_losses.png', dpi=300)
+    plt.savefig('predicted_vs_true_dtlz2.png', dpi=300)
     
     return fig
 
