@@ -1,8 +1,8 @@
-from surrogate_model import fit_gp_model, evaluate_model, plot_gp_surface_with_test_points, plot_predicted_vs_true, plot_gp_surface_with_test_points_enhanced, load_lambda_covariance_data, compute_and_save_covariance_samples, visualize_covariance_results, plot_optimal_values_surface, optimize_for_lambda
+from surrogate_model import fit_gp_model, evaluate_model, plot_gp_surface_with_test_points, plot_predicted_vs_true, plot_gp_surface_with_test_points_enhanced, load_lambda_covariance_data, compute_and_save_covariance_samples, visualize_covariance_results, plot_optimal_values_surface, optimize_for_lambda,train_and_prepare_surrogate
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-
+import joblib
 
 # --- Optimization parameters ---
 OPTIMIZER_BOUNDS = [(0.0, 2.0), (0.0, 2.0)] # Domain for x = [x_a, x_b]
@@ -17,10 +17,9 @@ np.random.seed(GLOBAL_SEED)
 # --- Data generation parameters ---
 NUM_LAMBDA_SAMPLES = 1000 # Number of base lambda vectors for dataset
 
-
 # Execute the code
 def main():
-    dataset_file = 'dtlz2_cov.csv'
+    dataset_file = 'losses_cov.csv'
     
     # Plot the optimal loss 3D surface
     plot_optimal_values_surface()
@@ -66,9 +65,9 @@ def main():
     # Show the plots
     plt.show()
     
-    """Main function to orchestrate the GP modeling and evaluation for DTLZ2"""
+    """Main function to orchestrate the GP modeling and evaluation """
     # Load the data
-    print("Loading lambda-covariance data for DTLZ2...")
+    print("Loading lambda-covariance data ...")
     data = load_lambda_covariance_data()
     print(f"Loaded {len(data)} samples.")
     
@@ -76,11 +75,14 @@ def main():
     data['lambda3'] = 1 - data['lambda1'] - data['lambda2']
     
     # Fit the GP model
-    model, X_train, X_test, y_train, y_test, scaler_X, scaler_y = fit_gp_model(data, n_training=500)
-    
+    surrogate_model, model, X_train, X_test, y_train, y_test, scaler_X, scaler_y= train_and_prepare_surrogate(data, n_training=500)
+    surrogate_model_path = 'surrogate_model.pkl'
+
+    joblib.dump(surrogate_model, surrogate_model_path)
+    print(f"Modello surrogate salvato in: {surrogate_model_path}")
     # Evaluate the model
     y_pred, y_std, metrics = evaluate_model(model, X_test, y_test, scaler_X, scaler_y)
-    
+
     # Print metrics
     print("\nModel performance on test data (before Active Learning):")
     for metric, value in metrics.items():
