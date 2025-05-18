@@ -6,6 +6,7 @@ from surrogate_model import fit_gp_model, optimize_for_lambda, hessian_estimatio
 import matplotlib.pyplot as plt
 import os
 import joblib
+from scipy.spatial.distance import cdist
 
 NUM_PERTURBATIONS = 20 # Number of perturbations for covariance estimation
 PERTURBATION_STRENGTH = 0.025 # Strength of lambda perturbations
@@ -13,7 +14,7 @@ GLOBAL_SEED = 42 # Define a global seed for reproducibility
 np.random.seed(GLOBAL_SEED)
 
 class ACOActiveLearner:
-    def __init__(self, lambda_data, surrogate_model=None):
+    def __init__(self, lambda_data, surrogate_model=None, rho=0.1):  # aggiungi rho
         self.lambda_data = lambda_data.copy()
         self.lambda_data['lambda3'] = 1 - self.lambda_data['lambda1'] - self.lambda_data['lambda2']
         self.lambdas = self.lambda_data[['lambda1', 'lambda2', 'lambda3']].values
@@ -26,6 +27,7 @@ class ACOActiveLearner:
         self.C_e = None
 
         self.epsilon_threshold = 1e-2
+        self.rho = rho  # salva rho
 
     def compute_heuristic(self):
         if self.surrogate is None:
@@ -52,7 +54,6 @@ class ACOActiveLearner:
         """
         Seleziona n_init_diverse lambda iniziali massimizzando la diversità (distanza euclidea).
         """
-        from scipy.spatial.distance import cdist
 
         all_lambdas = self.lambdas.copy()
         selected = []
@@ -162,6 +163,10 @@ class ACOActiveLearner:
             top_candidates = [lam for lam, _ in scored_candidates[:top_k]]
             print(f"Top-k candidati: {top_candidates}")
 
+            # --- EVAPORAZIONE DEL FEROMONE ---
+            for key in self.tau:
+                self.tau[key] = (1 - self.rho) * self.tau[key]
+
             for lam in top_candidates:
                 _, x_opt = optimize_for_lambda(lam)
                 cov_matrix, _ = hessian_estimation_for_lambda(lam)
@@ -169,6 +174,7 @@ class ACOActiveLearner:
 
                 self.update_selected_and_Ce(lam, cov_matrix)
 
+                # Deposito feromone dopo evaporazione
                 self.tau[lam] += sens_norm
                 self.eta[lam] = sens_norm
                 print(f"Lambda selezionato: {lam}, Sensitivity Norm: {sens_norm}")
@@ -192,27 +198,32 @@ class ACOActiveLearner:
         final_error = np.linalg.norm(C_ref - self.C_e, ord='fro') if self.C_e is not None else None
         print(f"Errore finale: {final_error}")
         return list(self.Selected), self.C_e, final_error
-    # Calcola la variazione dell'errore dall'aggiunta del nuovo lambda
-    def compute_delta_k(self, C_ref, candidate_lambda):
-        print(f"Calcolo delta_k per lambda: {candidate_lambda}")
-        selected_temp = self.Selected.union({tuple(candidate_lambda)})
-        if len(selected_temp) <= 1:
-            print("Numero insufficiente di elementi selezionati per calcolare Ce_augmented.")
-            return np.nan  # Corretto qui
+
+    def compute_Ce_from_lambdas(self, lambdas_list):
+        if len(lambdas_list) <= 1:
+            return None
         x_list = []
-        for lam in selected_temp:
+        for lam in lambdas_list:
             _, x_opt = hessian_estimation_for_lambda(lam)
             x_list.append(x_opt)
         X = np.array(x_list)
         x_bar = np.mean(X, axis=0)
         deviations = X - x_bar
-        Ce_augmented = (deviations.T @ deviations) / (len(selected_temp) - 1)
-        if C_ref.shape != Ce_augmented.shape:
-            raise ValueError(f"Dimensioni incompatibili: C_ref {C_ref.shape}, Ce_augmented {Ce_augmented.shape}")
+        C_e = (deviations.T @ deviations) / (len(lambdas_list) - 1)
+        return C_e
 
-        Ce_current = self.C_e if self.C_e is not None else np.zeros_like(C_ref)
-        delta_k = np.linalg.norm(C_ref - Ce_augmented, ord='fro') - np.linalg.norm(C_ref - Ce_current, ord='fro')
-        print(f"Delta_k: {delta_k}")
+    # Calcola la variazione dell'errore dall'aggiunta del nuovo lambda
+    def compute_delta_k(self, C_ref, lam):
+        # Seleziona solo il candidato corrente se Selected è vuoto
+        if not self.Selected:
+            # Calcola la matrice empirica solo con lam
+            C_e_single = self.compute_Ce_from_lambdas([lam])
+            delta_k = -np.linalg.norm(C_ref - C_e_single, ord='fro')
+        else:
+            # Calcola la matrice empirica con Selected ∪ {lam}
+            selected_lambdas = list(self.Selected) + [lam]
+            C_e_new = self.compute_Ce_from_lambdas(selected_lambdas)
+            delta_k = -np.linalg.norm(C_ref - C_e_new, ord='fro')
         return delta_k
 
     def retrain_surrogate(self, archive_data):
@@ -267,90 +278,24 @@ class ACOActiveLearner:
         # Ricalcola l'euristica
         self.compute_heuristic()
 
+def get_or_train_model(archive_file, model_path, n_training=100, random_state=42):
+    """
+    Carica un modello surrogato se esiste, altrimenti lo allena e lo salva.
+    """
+    import os
+    import joblib
+    from surrogate_model import train_and_prepare_surrogate, load_lambda_covariance_data
 
-    # Funzione principale per l'ACO + Active Learning
-    def run_aco_active_learning(self, C_ref, archive_data, n_ants=20, top_k=5,
-                               alpha=1.0, beta=1.0, omega=0.7,
-                               epsilon=None, budget=50, retrain_every=5, n_init_diverse=5):
-        if epsilon is None:
-            epsilon = self.epsilon_threshold
+    if os.path.exists(model_path):
+        print(f"Caricamento del modello salvato...")
+        surrogate_model = joblib.load(model_path)
+    else:
+        print(f"Alleno un nuovo modello surrogato...")
+        data = load_lambda_covariance_data(archive_file)
+        surrogate_model, *_ = train_and_prepare_surrogate(data, n_training, random_state)
+        joblib.dump(surrogate_model, model_path)
+    return surrogate_model
 
-        val_count = 0
-        # fissa iterazioni per il ciclo
-        while val_count < budget:
-            print(f"Iterazione {val_count + 1}/{budget}")
-            # 1. Campionamento candidati ACO
-            candidates = self.sample_candidates(n_ants=n_ants, alpha=alpha, beta=beta)
-
-            # 2. Ricalcolo euristica per candidati
-            for lam in candidates:
-                X = np.array([[lam[0], lam[1]]])
-                X_scaled = self.surrogate['scaler_X'].transform(X)
-                y_pred_scaled, _ = self.surrogate['model'].predict(X_scaled, return_std=True)
-                y_pred = self.surrogate['scaler_y'].inverse_transform(y_pred_scaled.reshape(-1, 1)).ravel()
-                self.eta[lam] = y_pred[0]
-                print(f"Lambda: {lam}, Predicted Heuristic: {y_pred[0]}")
-
-            # 3. Calcolo Δ_k
-            delta_k_list = []
-            for lam in candidates:
-                delta_k = self.compute_delta_k(C_ref, lam)
-                delta_k_list.append((lam, delta_k))
-
-            # 4. Selezione top-k (mix Δ_k e η)
-            scored_candidates = []
-            for lam, delta_k in delta_k_list:
-                score = omega * delta_k + (1 - omega) * self.eta[lam]
-                scored_candidates.append((lam, score))
-                print(f"Lambda: {lam}, Score: {score}")
-
-            scored_candidates.sort(key=lambda x: x[1])  # score più basso = maggiore riduzione errore
-            top_candidates = [lam for lam, _ in scored_candidates[:top_k]]
-            print(f"Top-k candidati: {top_candidates}")
-
-            # 5. Valutazione esatta e aggiornamento
-            for lam in top_candidates:
-                _, x_opt = optimize_for_lambda(lam)
-                cov_matrix, _ = hessian_estimation_for_lambda(lam)
-                sens_norm = np.linalg.norm(cov_matrix, ord='fro')
-
-                self.update_selected_and_Ce(lam, cov_matrix)
-
-                # Update pheromone and heuristic
-                self.tau[lam] += sens_norm
-                self.eta[lam] = sens_norm
-                print(f"Lambda selezionato: {lam}, Sensitivity Norm: {sens_norm}")
-
-                val_count += 1
-
-                # Controllo convergenza
-                if self.C_e is not None:
-                    error = np.linalg.norm(C_ref - self.C_e, ord='fro')
-                    print(f"Errore attuale: {error}")
-                    if error < epsilon or val_count >= budget:
-                        print("Condizione di arresto raggiunta.")
-                        return list(self.Selected), self.C_e, error
-
-            # 6. Retraining surrogato periodico
-            if val_count % retrain_every == 0:
-                print("Riaddestramento del modello surrogato...")
-                self.retrain_surrogate(archive_data)
-
-        # Fine ciclo: ritorna stato finale
-        final_error = np.linalg.norm(C_ref - self.C_e, ord='fro') if self.C_e is not None else None
-        print(f"Errore finale: {final_error}")
-        return list(self.Selected), self.C_e, final_error
-
-    def get_or_train_model(archive_data, model_path='surrogate_model.pkl'):
-        if os.path.exists(model_path):
-            print("Caricamento del modello salvato...")
-            gp_model = joblib.load(model_path)
-        else:
-            print("Modello non trovato. Eseguo il training...")
-            gp_model = train_and_prepare_surrogate(archive_data, n_training=500)
-            joblib.dump(gp_model, model_path)
-            print("Modello salvato in:", model_path)
-        return gp_model
 # main.py
 
 def main():
