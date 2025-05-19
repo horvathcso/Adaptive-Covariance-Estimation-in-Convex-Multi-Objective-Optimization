@@ -14,10 +14,16 @@ from sklearn.metrics import mean_squared_error, r2_score
 import concurrent.futures
 from filelock import FileLock
 import time
+import random
+GLOBAL_SEED = 42
+np.random.seed(GLOBAL_SEED)
+random.seed(GLOBAL_SEED)
 NUM_PERTURBATIONS = 20 # Number of perturbations for covariance estimation
 PERTURBATION_STRENGTH = 0.025 # Strength of lambda perturbations
-GLOBAL_SEED = 42 # Define a global seed for reproducibility
-np.random.seed(GLOBAL_SEED)
+
+def round_lambda(lam, ndigits=8):
+    arr = np.asarray(lam)
+    return tuple(np.round(arr.astype(float), ndigits))
 
 class ACOActiveLearner:
     def __init__(self, lambda_data, surrogate_model=None, rho=0.1):  # aggiungi rho
@@ -46,21 +52,20 @@ class ACOActiveLearner:
         y_pred = self.surrogate['scaler_y'].inverse_transform(y_pred_scaled.reshape(-1, 1)).ravel()
 
         for i, lam in enumerate(self.lambdas):
-            self.eta[tuple(lam)] = y_pred[i]
+            key = round_lambda(lam)
+            self.eta[key] = y_pred[i]
             
 
-    # Restituisce i valori di tau e eta
-    def get_pheromone_and_heuristic(self):
-        return self.tau, self.eta
 
-    def get_initial_state(self):
-        return self.Selected, self.C_e, self.epsilon_threshold
-
-
-    def select_initial_diverse_lambdas(self, n_init_diverse=5, random_state=None, exclude_lambdas=None):
+    def select_initial_diverse_lambdas(self, n_init_diverse=20, random_state=None, exclude_lambdas=None):
         """
         Seleziona n_init_diverse lambda iniziali massimizzando la diversità (distanza euclidea).
+        Garantisce che ogni lambda sia nell'intervallo [0, 1] e la somma sia 1.
         """
+        def normalize_lambda(lam):
+            lam = np.clip(lam, 0, 1)
+            return lam / np.sum(lam)
+
         if exclude_lambdas is None:
             exclude_lambdas = set()
         if not self.eta:
@@ -70,13 +75,19 @@ class ACOActiveLearner:
         if random_state is not None:
             rng = np.random.RandomState(random_state)
             rng.shuffle(sorted_lambdas)
+        else:
+            rng = np.random.RandomState(GLOBAL_SEED)
+            rng.shuffle(sorted_lambdas)
 
         selected = []
         seen = set()
         for lam, score in sorted_lambdas:
-            if lam not in seen and lam not in exclude_lambdas:
-                selected.append(np.array(lam))
-                seen.add(lam)
+            lam_arr = np.array(lam)
+            lam_arr = normalize_lambda(lam_arr)
+            lam_tuple = tuple(lam_arr)
+            if lam_tuple not in seen and lam_tuple not in exclude_lambdas:
+                selected.append(lam_arr)
+                seen.add(lam_tuple)
             if len(selected) >= n_init_diverse:
                 break
 
@@ -86,24 +97,16 @@ class ACOActiveLearner:
 
     # campionamento dei valori di lamnda da assegnare alle formiche in base a tau e eta
     def sample_candidates(self, n_ants=20, alpha=1.0, beta=1.0):
-           
-        print("Campionamento candidati...")
+        if not self.eta:
+            raise ValueError("Euristica (eta) vuota: chiama prima compute_heuristic().")
         keys = list(self.eta.keys())
-        scores = np.array([
-            (self.tau[lam] ** alpha) * (self.eta[lam] ** beta) for lam in keys
-        ])
-        # Rendi i punteggi non negativi
+        scores = np.array([(self.tau[lam] ** alpha) * (self.eta[lam] ** beta) for lam in keys])
         min_score = np.min(scores)
         if min_score < 0:
             scores = scores - min_score + 1e-8
-        if np.sum(scores) == 0:
-            probs = np.ones_like(scores) / len(scores)
-        else:
-            probs = scores / np.sum(scores)
-        print(f"Probabilità di campionamento: {probs}")
-        indices = np.random.choice(len(keys), size=n_ants, replace=False, p=probs)
-        sampled = [keys[i] for i in indices]
-        print(f"Candidati campionati: {sampled}")
+        probs = scores / np.sum(scores) if np.sum(scores) != 0 else np.ones_like(scores) / len(scores)
+        n_sample = min(n_ants, len(keys))
+        indices = np.random.choice(len(keys), size=n_sample, replace=False, p=probs)
         return [keys[i] for i in indices]
 
     # Aggiorna la lista di lambda selezionati e calcola la matrice di covarianza empirica C_e
@@ -119,7 +122,7 @@ class ACOActiveLearner:
 
         x_list = []
         for lam in self.Selected:
-            _, x_opt = optimize_for_lambda(lam)
+            x_opt,_ = optimize_for_lambda(lam)
             x_list.append(x_opt)
         X = np.array(x_list)
         x_bar = np.mean(X, axis=0)
@@ -131,12 +134,15 @@ class ACOActiveLearner:
         else:
             self.C_e = None
 
-    def compute_Ce_from_lambdas(lambdas_list):
+    def compute_Ce_from_lambdas(self,lambdas_list):
         if len(lambdas_list) <= 1:
-            return np.zeros_like(C_ref)
+            print(f'Numero insufficiente di lambda ({len(lambdas_list)}) per calcolare C_e.')
+        
+            # Restituisci una matrice nulla della dimensione giusta
+            return None
         x_list = []
         for lam in lambdas_list:
-            _, x_opt = optimize_for_lambda(lam)
+            x_opt,_ = optimize_for_lambda(lam)
             x_list.append(x_opt)
         X = np.array(x_list)
         x_bar = np.mean(X, axis=0)
@@ -222,7 +228,37 @@ class ACOActiveLearner:
         for lam, pred in zip(self.Selected, y_pred):
             print(f"  Lambda: {lam}, Predizione surrogato: {pred:.4f}")
             
-      
+    def fitness_moaco(self, lam, norm, C_ref, Selected, w1, w2):
+        S_lam = norm[round_lambda(lam)]
+        delta_k = self.compute_delta_k(C_ref, lam)
+        # delta_k misura la variazione dell'errore aggiungendo lam
+        # Se vuoi massimizzare la fitness, puoi invertire il segno di delta_k se necessario
+        return w1 * S_lam - w2 * delta_k
+
+    def optimize_weights(self, C_ref, Selected, candidates, norm, w_grid, k_frac=0.1):
+        """
+        Trova la combinazione di pesi (w1, w2) che minimizza la variazione media di covarianza
+        tra i migliori candidati. Usa un parametro k dinamico: k = max(1, int(k_frac * len(candidates)))
+        """
+        best_score = np.inf
+        best_weights = None
+        k = max(1, int(k_frac * len(candidates)))
+        for w1 in w_grid['w1']:
+            for w2 in w_grid['w2']:
+                fitness_list = [(lam, self.fitness_moaco(lam, norm, C_ref, Selected, w1, w2))
+                                for lam in candidates]
+                fitness_list.sort(key=lambda x: x[1], reverse=True)
+                top_k = [lam for lam, _ in fitness_list[:k]]
+                delta_sum = 0
+                for lam in top_k:
+                    C_e_old = self.compute_Ce_from_lambdas(Selected)
+                    C_e_new = self.compute_Ce_from_lambdas(list(Selected) + [lam])
+                    if C_e_old is not None and C_e_new is not None:
+                        delta_sum += np.linalg.norm(C_e_new - C_e_old, ord='fro')
+                if delta_sum < best_score:
+                    best_score = delta_sum
+                    best_weights = (w1, w2)
+        return best_weights
             
 
 def get_or_train_model(archive_file, model_path, n_training=100, random_state=42):
@@ -243,34 +279,35 @@ def get_or_train_model(archive_file, model_path, n_training=100, random_state=42
 def run_colony(colony_id, archive_data, gp_model, C_ref, params, already_selected=None):
     print(f"Avvio colonia {colony_id}")
     learner= ACOActiveLearner(archive_data, gp_model)
-    # Diversifica i lambda iniziali per ogni colonia (es: random seed diverso)
-    print(f"Colonia {colony_id}: calcolo euristica")
     learner.compute_heuristic()
+    learner.select_initial_diverse_lambdas(n_init_diverse=150, random_state=GLOBAL_SEED)
+    Selected = set(learner.Selected)
+    val_count = len(Selected)
     print(f"Colonia {colony_id}: selezione iniziale diversificata")
     if already_selected is None:
         already_selected = set()
     learner.select_initial_diverse_lambdas(
-        n_init_diverse=params['n_init_diverse'],
-        random_state=colony_id  + GLOBAL_SEED,
+        n_init_diverse=20,
+        random_state=GLOBAL_SEED+ colony_id,  # oppure GLOBAL_SEED + colony_id se in parallelo
         exclude_lambdas=already_selected
     )
     print(f"Colonia {colony_id}: avvio ACO, Lambda iniziali: {list(learner.Selected)}")
-    Selected, C_e, final_error = aco.run_aco_active_learning(
-    C_ref=C_ref,
-    archive_data=archive_data,
-    n_ants=params['n_ants'],
-    top_k=params['top_k'],
-    alpha=params['alpha'],
-    beta=params['beta'],
-    omega=params['omega'],
-    epsilon=params['epsilon'],
-    budget=params['budget'],
-    retrain_every=params['retrain_every'],
-    n_init_diverse=params['n_init_diverse'],
-    exclude_lambdas=already_selected,
-    random_state=colony_id
+    Selected, C_e, final_error = learner.run_aco_active_learning(
+        C_ref=C_ref,
+        archive_data=archive_data,
+        n_ants=params['n_ants'],
+        top_k=params['top_k'],
+        alpha=params['alpha'],
+        beta=params['beta'],
+        omega=params['omega'],
+        epsilon=params['epsilon'],
+        budget=params['budget'],
+        retrain_every=params['retrain_every'],
+        n_init_diverse=params['n_init_diverse'],
+        exclude_lambdas=already_selected,
+        random_state=colony_id
     )
-return list(Selected)
+    return list(Selected)
 
 def append_new_selected(lam, results_dict, shared_file="shared_selected.csv"):
     # results_dict: dict con info su lambda, sensitività, ecc.
@@ -303,52 +340,25 @@ def maybe_reload_surrogate(local_model, model_path="surrogate_global.pkl", last_
             return surrogate, mtime
     return local_model, last_mtime
 
-
-
-def proxy_cov_diff( C_ref, lam):
-    x_list = []
-    expected_shape = None
-    for l in Selected:
-        _, x_opt = optimize_for_lambda(l)
-        x_opt_flat = np.asarray(x_opt).flatten()
-        if expected_shape is None:
-            expected_shape = x_opt_flat.shape
-        if x_opt_flat.shape != expected_shape:
-            # Pad o tronca per forzare la shape
-            x_opt_flat = np.resize(x_opt_flat, expected_shape)
-        x_list.append(x_opt_flat)
-    _, x_opt_new = optimize_for_lambda(lam)
-    x_opt_new_flat = np.asarray(x_opt_new).flatten()
-    if expected_shape is not None and x_opt_new_flat.shape != expected_shape:
-        x_opt_new_flat = np.resize(x_opt_new_flat, expected_shape)
-    x_list.append(x_opt_new_flat)
-    X = np.vstack(x_list)
-    x_bar = np.mean(X, axis=0)
-    deviations = X - x_bar
-    if len(x_list) > 1:
-        C_e_proxy = (deviations.T @ deviations) / (len(x_list) - 1)
-    else:
-        C_e_proxy = np.zeros((X.shape[1], X.shape[1]))
-    return np.linalg.norm(C_ref - C_e_proxy, ord='fro')
-
-def fitness_moaco(lam, norm, C_ref, Selected, w1, w2):
-    S_lam = norm[lam]
-    C_e_proxy = compute_Ce_from_lambdas(list(Selected) + [lam])
+def fitness_moaco(self,lam, norm, C_ref, Selected, w1, w2):
+    S_lam = norm[round_lambda(lam)]
+    C_e_proxy = self.compute_Ce_from_lambdas(list(Selected) + [lam])
     proxy_diff = np.linalg.norm(C_ref - C_e_proxy, ord='fro')
     return w1 * S_lam - w2 * proxy_diff
 
-def optimize_weights(C_ref, Selected, candidates, norm, w_grid):
+def optimize_weights(self,C_ref, Selected, candidates, norm, w_grid):
     best_score = np.inf
     best_weights = None
     for w1 in w_grid['w1']:
         for w2 in w_grid['w2']:
-            fitness_list = [(lam, fitness_moaco(lam, norm, C_ref, Selected, w1, w2)) for lam in candidates]
+            fitness_list =  [(lam, fitness_moaco(self,lam, norm, C_ref, Selected, w1, w2))
+                for lam in candidates]
             fitness_list.sort(key=lambda x: x[1], reverse=True)
             top_k = [lam for lam, _ in fitness_list[:5]]
             delta_sum = 0
             for lam in top_k:
-                C_e_old = compute_Ce_from_lambdas(Selected)
-                C_e_new = compute_Ce_from_lambdas(list(Selected) + [lam])
+                C_e_old = self.compute_Ce_from_lambdas(Selected)
+                C_e_new = self.compute_Ce_from_lambdas(list(Selected) + [lam])
                 delta_k = np.linalg.norm(C_ref - C_e_new, ord='fro') - np.linalg.norm(C_ref - C_e_old, ord='fro')
                 delta_sum += abs(delta_k)
             if delta_sum < best_score:
@@ -357,9 +367,8 @@ def optimize_weights(C_ref, Selected, candidates, norm, w_grid):
     return best_weights
 
 
-
 def main():
-    print("Inizio script MOACO logica pesata")
+    print("Inizio script MOACO alterativa 1")
     archive_file = 'losses_cov.csv'
     ground_truth_file = 'results_covariance1.csv'
     model_path = 'surrogate_model.pkl'
@@ -368,17 +377,21 @@ def main():
     C_ref = pd.read_csv(ground_truth_file, header=None).values
 
     surrogate_model = get_or_train_model(archive_file, model_path, n_training=500)
-
+    learner = ACOActiveLearner(archive_data, surrogate_model)
+    learner.compute_heuristic()
+    # Popola norm con le stesse chiavi di self.eta
+    norm = learner.eta.copy()
     # 1. Inizializzazione
+    learner.select_initial_diverse_lambdas(n_init_diverse=150, random_state=GLOBAL_SEED)
+    Selected = set(learner.Selected)
+    val_count = len(Selected)
     Lambda = [tuple(row) for row in archive_data[['lambda1', 'lambda2', 'lambda3']].values]
-    Selected = set()
     C_e = np.zeros_like(C_ref)
     tau = defaultdict(lambda: 1.0)
-    norm = {}
     w1, w2 = 1.0, 1.0
 
-    n_ants = 30
-    top_k = 5
+    n_ants = 150
+    top_k = 50
     retrain_every = 5
     budget = 30
     alpha = 1.0
@@ -387,62 +400,64 @@ def main():
     error_list = []
     w_grid = {'w1': np.linspace(0.5, 2.0, 4), 'w2': np.linspace(0.5, 2.0, 4)}
 
-    val_count = len(Selected)
     iter_num = 0
 
-    while val_count < budget:
+    while val_count > budget:
         print(f"\nIterazione {val_count+1}/{budget}")
 
-        # 2. Ottimizzazione pesi
-        # Aggiorna norm per tutti i candidati
-        for lam in Lambda:
-            X = np.array([[lam[0], lam[1]]])
-            X_scaled = surrogate_model['scaler_X'].transform(X)
-            y_pred_scaled, _ = surrogate_model['model'].predict(X_scaled, return_std=True)
-            y_pred = surrogate_model['scaler_y'].inverse_transform(y_pred_scaled.reshape(-1, 1)).ravel()
-            norm[lam] = y_pred[0]
-        candidates = sample_candidates(n_ants=n_ants, alpha=alpha, beta=beta)
-        best_weights = optimize_weights(C_ref, Selected, candidates, norm, w_grid)
-        if best_weights is not None:
-            w1, w2 = best_weights
+        # 1. Evaporazione del feromone
+        evaporation_rate = 0.8
+        for lam in Selected:
+            tau[lam] *= evaporation_rate
+
+        # Definisci i candidati prima di ottimizzare i pesi
+        candidates = list(Selected)  # oppure usa sample_candidates se preferisci
+
+        # 2. Calcola pesi ottimali per la fitness
+        w1, w2 = learner.optimize_weights(C_ref, Selected, candidates, norm, w_grid, k_frac=0.1)
         print(f"Pesi ottimali trovati: w1={w1}, w2={w2}")
 
-        # 3. Loop ACO
-        C_e_current = compute_Ce_from_lambdas(Selected)
-        fitness_list = [(lam, fitness_moaco(lam, norm, C_ref, Selected, w1, w2)) for lam in candidates]
-        fitness_list.sort(key=lambda x: x[1], reverse=True)
-        top_candidates = [lam for lam, _ in fitness_list[:top_k]]
-
-        print("Top-k candidati:")
-        for lam, fit in fitness_list[:top_k]:
-            print(f"  Lambda: {lam}, Fitness: {fit:.4f}")
-
-        for lam in top_candidates:
-            if lam not in Selected:
-                _, x_opt = optimize_for_lambda(lam)
-                cov_matrix = compute_covariance_matrix(lam)
-                sens_norm = np.linalg.norm(cov_matrix, ord='fro')
-                Selected.add(lam)
-                tau[lam] += sens_norm
-                norm[lam] = sens_norm
+        # 3. Calcola fitness e aggiorna feromone SOLO sui lambda selezionati
+        fitness_dict = {}
+        for lam in Selected:
+            fit = learner.fitness_moaco(lam, norm, C_ref, Selected, w1, w2)
+            fitness_dict[lam] = fit
+            tau[lam] += fit  # deposito di feromone proporzionale alla fitness
 
         # Aggiorna C_e
-        C_e = compute_Ce_from_lambdas(Selected)
-        error = np.linalg.norm(C_ref - C_e, ord='fro')
+        C_e = learner.compute_Ce_from_lambdas(Selected)
+        if C_e is not None:
+            error = np.linalg.norm(C_ref - C_e, ord='fro')
+        else:
+            error = None
         error_list.append(error)
         print(f"Errore attuale dopo batch: {error:.4f}")
+
+        # 3. Pruning: elimina lambda con fitness/feromone più basso e troppo vicini
+        if len(Selected) > budget:
+            print(f"Pruning: mantengo solo i {budget} lambda migliori e distanti almeno min_dist.")
+            min_dist = 0.05  # scegli il valore più adatto al tuo problema
+            sorted_lambdas = sorted(list(Selected), key=lambda l: tau[l], reverse=True)
+            pruned = []
+            for lam in sorted_lambdas:
+                lam_arr = np.array(lam)
+                if all(np.linalg.norm(lam_arr - np.array(other)) >= min_dist for other in pruned):
+                    pruned.append(lam)
+                if len(pruned) >= budget:
+                    break
+            Selected = set(pruned)
+            # Rimuovi anche dal dizionario tau quelli eliminati
+            for lam in list(tau.keys()):
+                if lam not in Selected:
+                    del tau[lam]
 
         # Aggiorna surrogato ogni retrain_every iterazioni
         iter_num += 1
         if iter_num % retrain_every == 0:
-            # Riaddestra il surrogato con i nuovi dati
-            # (implementa se vuoi, oppure lascia commentato)
             pass
 
         val_count = len(Selected)
-
-        # Condizione di terminazione
-        if error < 1e-3:
+        if error is not None and error < 1e-3:
             print("Errore sufficientemente piccolo, termino.")
             break
 
@@ -452,6 +467,16 @@ def main():
     print(f"Pesi ottimali finali: w1={w1}, w2={w2}")
     for lam in Selected:
         print(f"  {lam}")
+    print("lambda selezionati (unici):",Selected)
+    # Stampa le due matrici in modo leggibile
+    print("\nMatrice C_ref (Ground Truth):")
+    print(np.array2string(C_ref, precision=4, suppress_small=True))
+
+    print("\nMatrice C_e finale (Empirica):")
+    if C_e is not None:
+        print(np.array2string(C_e, precision=4, suppress_small=True))
+    else:
+        print("C_e non disponibile.")
 
     plt.plot(error_list)
     plt.xlabel("Iterazione")
